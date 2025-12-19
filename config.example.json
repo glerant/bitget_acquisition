@@ -1,0 +1,87 @@
+{
+  "version": "0.1.0",
+
+  "db": {
+    "host": "",
+    "port": 3306,
+    "user": "",
+    "password": "",
+    "database": "bitget_pipeline"
+  },
+
+  "bitget": {
+    "base_url": "wss://ws.bitget.com/v2/ws/public",
+    "api_key": "",
+    "api_secret": "",
+    "passphrase": "",
+    "use_auth": false,
+    "rate_limits": {
+      "max_requests_per_minute": 900,
+      "max_requests_per_second": 15
+    }
+  },
+
+  "acquisition": {
+    "markets": {
+      "spot": {
+        "enabled": true,
+        "symbols": [
+          "BTCUSDT",
+          "ETHUSDT",
+          "SOLUSDT",
+          "BNBUSDT",
+          "XRPUSDT",
+          "ADAUSDT",
+          "AVAXUSDT",
+          "DOGEUSDT",
+          "LINKUSDT",
+          "LTCUSDT"
+        ]
+      },
+      "perpetual": {
+        "enabled": true,
+        "symbols": [
+          "BTCUSDT",
+          "ETHUSDT",
+          "SOLUSDT",
+          "BNBUSDT",
+          "XRPUSDT",
+          "ADAUSDT",
+          "AVAXUSDT",
+          "DOGEUSDT",
+          "LINKUSDT",
+          "LTCUSDT"
+        ]
+      }
+    },
+
+    "enable_klines": true,
+    "enable_trades": true,
+
+    "enable_orderbook": true,
+    "orderbook_levels": 5,
+    "orderbook_depth": 50,
+
+    "kline_interval": "1m",
+
+    "history_start": "2024-01-01T00:00:00Z",
+    "history_end": null,
+
+    "live_poll_intervals": {
+      "klines_seconds": 15,
+      "trades_seconds": 5,
+      "orderbook_seconds": 10
+    },
+
+    "max_history_days": 365,
+    "kline_batch_size": 200,
+    "trade_batch_size": 1000,
+    "trade_history_days": 30,
+
+    "auto_gap_backfill_minutes": 60
+  },
+
+  "logging": {
+    "level": "INFO"
+  }
+}

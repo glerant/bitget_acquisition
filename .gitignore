@@ -1,0 +1,9 @@
+
+.bitget-v01/
+__pycache__/
+*.pyc
+config.json
+.vscode/
+.DS_Store
+/bitget
+/ext

@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Bitget Acquisition Pipeline Status</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- If you *really* want hard HTML refresh too, uncomment this:
+  <meta http-equiv="refresh" content="60">
+  -->
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 1rem 2rem;
+      background: #0b1020;
+      color: #f2f2f2;
+    }
+    h1 {
+      margin-top: 0;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 1.0rem;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .meta {
+      font-size: 0.9rem;
+      opacity: 0.85;
+    }
+
+    .health-bar {
+      padding: 0.6rem 0.9rem;
+      border-radius: 0.6rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    .health-ok {
+      background: #093022;
+      color: #6cf5b2;
+      border: 1px solid #1f6b47;
+    }
+    .health-warn {
+      background: #3b2b12;
+      color: #ffd47f;
+      border: 1px solid #8b6a1a;
+    }
+    .health-bad {
+      background: #3b1218;
+      color: #ff9ba9;
+      border: 1px solid #a5303f;
+    }
+    .health-dot {
+      width: 0.6rem;
+      height: 0.6rem;
+      border-radius: 999px;
+      background: currentColor;
+    }
+
+    .stats-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+      font-size: 0.85rem;
+    }
+    .stat-pill {
+      background: #151a2f;
+      padding: 0.4rem 0.7rem;
+      border-radius: 999px;
+      border: 1px solid #22263a;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .stat-label {
+      opacity: 0.7;
+    }
+    .stat-value {
+      font-weight: 600;
+      font-feature-settings: "tnum" 1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .error {
+      padding: 0.7rem 1rem;
+      background: #3b1218;
+      border-left: 4px solid #ff6b81;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+      display: none;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 0.5rem;
+    }
+    th, td {
+      padding: 0.4rem 0.5rem;
+      text-align: left;
+      border-bottom: 1px solid #22263a;
+      font-size: 0.9rem;
+      white-space: nowrap;
+    }
+    th {
+      background: #151a2f;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    tr:nth-child(even) {
+      background: #101426;
+    }
+
+    .status-pill {
+      display: inline-block;
+      padding: 0.1rem 0.5rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .sync-ok { background: #16331f; color: #5be481; }
+    .sync-running { background: #302511; color: #ffc857; }
+    .sync-pending { background: #202943; color: #9db8ff; }
+    .sync-error { background: #3b1218; color: #ff6b81; }
+
+    .req-idle { background: #283043; color: #c7d0ff; }
+    .req-backfill { background: #2b1c4b; color: #e8b4ff; }
+    .req-gap_fill { background: #2b2235; color: #fdd280; }
+    .req-live { background: #073424; color: #68f0bd; }
+
+    .stale-yes { color: #ff6b81; font-weight: 600; }
+    .stale-no  { color: #68f0bd; }
+
+    .age {
+      font-feature-settings: "tnum" 1;
+      font-variant-numeric: tabular-nums;
+      opacity: 0.9;
+    }
+
+    .small {
+      font-size: 0.8rem;
+      opacity: 0.8;
+    }
+
+    .footer-note {
+      margin-top: 1rem;
+      font-size: 0.8rem;
+      opacity: 0.7;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1>Acquisition Pipeline Status</h1>
+      <div class="meta">
+        Pipeline version:
+        <strong id="pipeline-version">{{ app_version }}</strong> ·
+        auto_gap_backfill_minutes:
+        <strong id="gap-minutes">{{ auto_gap_backfill_minutes }}</strong>
+      </div>
+    </div>
+    <div id="global-health" class="health-bar health-warn">
+      <span class="health-dot"></span>
+      <span id="global-health-text">Loading…</span>
+    </div>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-pill">
+      <span class="stat-label">Symbols</span>
+      <span id="stat-total" class="stat-value">0</span>
+    </div>
+    <div class="stat-pill">
+      <span class="stat-label">OK / live</span>
+      <span id="stat-ok-live" class="stat-value">0</span>
+    </div>
+    <div class="stat-pill">
+      <span class="stat-label">Running</span>
+      <span id="stat-running" class="stat-value">0</span>
+    </div>
+    <div class="stat-pill">
+      <span class="stat-label">Pending</span>
+      <span id="stat-pending" class="stat-value">0</span>
+    </div>
+    <div class="stat-pill">
+      <span class="stat-label">Error</span>
+      <span id="stat-error" class="stat-value">0</span>
+    </div>
+    <div class="stat-pill">
+      <span class="stat-label">Kline stale</span>
+      <span id="stat-kline-stale" class="stat-value">0</span>
+    </div>
+    <div class="stat-pill">
+      <span class="stat-label">Trade stale</span>
+      <span id="stat-trade-stale" class="stat-value">0</span>
+    </div>
+    <div class="stat-pill">
+      <span class="stat-label">Last refresh</span>
+      <span id="stat-last-refresh" class="stat-value">–</span>
+    </div>
+  </div>
+
+  <div id="error-banner" class="error"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Sync</th>
+        <th>Request</th>
+        <th>Kline last time</th>
+        <th>Kline age</th>
+        <th>Trade last time</th>
+        <th>Trade age</th>
+        <th>Row last_updated</th>
+      </tr>
+    </thead>
+    <tbody id="status-body">
+      <!-- Filled by JS -->
+    </tbody>
+  </table>
+
+  <p class="footer-note">
+    Staleness thresholds (in JS): 5 min for klines, 60 s for trades.
+    Adjust in <code>dashboard.html</code> as needed.
+  </p>
+
+  <script>
+    const REFRESH_INTERVAL_MS = 5000;       // 5 seconds
+    const KLINE_STALE_THRESHOLD = 5 * 60;   // 5 minutes, in seconds
+    const TRADE_STALE_THRESHOLD = 60;       // 60 seconds
+
+    async function fetchStatus() {
+      const errorBanner = document.getElementById("error-banner");
+      try {
+        const res = await fetch("/api/pipeline_status", { cache: "no-store" });
+        if (!res.ok) {
+          throw new Error("HTTP " + res.status);
+        }
+        const data = await res.json();
+
+        // Update header meta (version, gap minutes) from API
+        if (data.version !== undefined) {
+          document.getElementById("pipeline-version").textContent = data.version;
+        }
+        if (data.auto_gap_backfill_minutes !== undefined) {
+          document.getElementById("gap-minutes").textContent = data.auto_gap_backfill_minutes;
+        }
+
+        // Error banner from backend (e.g., DB issue)
+        if (data.error) {
+          errorBanner.textContent = data.error;
+          errorBanner.style.display = "block";
+        } else {
+          errorBanner.textContent = "";
+          errorBanner.style.display = "none";
+        }
+
+        const symbols = data.symbols || [];
+        renderTable(symbols);
+        renderStats(symbols);
+
+        // Last refresh time (local)
+        const now = new Date();
+        document.getElementById("stat-last-refresh").textContent =
+          now.toLocaleTimeString();
+
+      } catch (err) {
+        console.error("Fetch error:", err);
+        errorBanner.textContent = "Failed to fetch pipeline status: " + err;
+        errorBanner.style.display = "block";
+      }
+    }
+
+    function renderTable(symbols) {
+      const tbody = document.getElementById("status-body");
+      tbody.innerHTML = "";
+
+      for (const r of symbols) {
+        const kAgeSec = r.kline_last_time_age_sec;
+        const tAgeSec = r.trade_last_time_age_sec;
+
+        const kStale = kAgeSec !== null && kAgeSec > KLINE_STALE_THRESHOLD;
+        const tStale = tAgeSec !== null && tAgeSec > TRADE_STALE_THRESHOLD;
+
+        const kAgeStr = kAgeSec === null
+          ? "n/a"
+          : Math.floor(kAgeSec / 60) + " min";
+
+        const tAgeStr = tAgeSec === null
+          ? "n/a"
+          : Math.floor(tAgeSec) + " s";
+
+        const syncClass = "sync-" + (r.sync_status || "pending");
+        const reqClass = "req-" + (r.request_status || "idle");
+
+        // Compact market label
+        let marketLabel = "";
+        if (r.market_type === "spot") {
+          marketLabel = "spot";
+        } else if (r.market_type === "futures") {
+          marketLabel = "perp";
+        } else if (r.market_type) {
+          marketLabel = r.market_type;
+        }
+
+        const symbolCell = marketLabel
+          ? `${r.symbol} <span class="small">(${marketLabel})</span>`
+          : r.symbol;
+
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${symbolCell}</td>
+          <td>
+            <span class="status-pill ${syncClass}">${r.sync_status}</span>
+          </td>
+          <td>
+            <span class="status-pill ${reqClass}">${r.request_status}</span>
+          </td>
+          <td>${r.kline_last_time ?? "–"}</td>
+          <td class="age">
+            ${
+              kAgeSec === null
+                ? '<span class="small">n/a</span>'
+                : `<span class="${kStale ? "stale-yes" : "stale-no"}">${kAgeStr}</span>`
+            }
+          </td>
+          <td>${r.trade_last_time ?? "–"}</td>
+          <td class="age">
+            ${
+              tAgeSec === null
+                ? '<span class="small">n/a</span>'
+                : `<span class="${tStale ? "stale-yes" : "stale-no"}">${tAgeStr}</span>`
+            }
+          </td>
+          <td>${r.last_updated ?? "–"}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    function renderStats(symbols) {
+      const total = symbols.length;
+      let okLive = 0;
+      let running = 0;
+      let pending = 0;
+      let error = 0;
+      let kStaleCount = 0;
+      let tStaleCount = 0;
+
+      for (const r of symbols) {
+        if (r.sync_status === "ok" && r.request_status === "live") {
+          okLive += 1;
+        }
+        if (r.sync_status === "running") {
+          running += 1;
+        }
+        if (r.sync_status === "pending") {
+          pending += 1;
+        }
+        if (r.sync_status === "error") {
+          error += 1;
+        }
+
+        const kAgeSec = r.kline_last_time_age_sec;
+        const tAgeSec = r.trade_last_time_age_sec;
+
+        if (kAgeSec === null || kAgeSec > KLINE_STALE_THRESHOLD) {
+          kStaleCount += 1;
+        }
+        if (tAgeSec === null || tAgeSec > TRADE_STALE_THRESHOLD) {
+          tStaleCount += 1;
+        }
+      }
+
+      document.getElementById("stat-total").textContent = total;
+      document.getElementById("stat-ok-live").textContent = okLive;
+      document.getElementById("stat-running").textContent = running;
+      document.getElementById("stat-pending").textContent = pending;
+      document.getElementById("stat-error").textContent = error;
+      document.getElementById("stat-kline-stale").textContent = kStaleCount;
+      document.getElementById("stat-trade-stale").textContent = tStaleCount;
+
+      // Global health logic:
+      const healthDiv = document.getElementById("global-health");
+      const healthText = document.getElementById("global-health-text");
+
+      // Default: warn
+      let healthClass = "health-warn";
+      let text = "Degraded";
+
+      if (total === 0) {
+        healthClass = "health-warn";
+        text = "No symbols";
+      } else if (error > 0) {
+        healthClass = "health-bad";
+        text = "Errors present";
+      } else if (kStaleCount === 0 && tStaleCount === 0 && running === 0 && pending === 0) {
+        healthClass = "health-ok";
+        text = "Healthy";
+      } else if (kStaleCount === total || tStaleCount === total) {
+        healthClass = "health-bad";
+        text = "All stale";
+      } else {
+        healthClass = "health-warn";
+        text = "Mixed";
+      }
+
+      healthDiv.classList.remove("health-ok", "health-warn", "health-bad");
+      healthDiv.classList.add(healthClass);
+      healthText.textContent = text;
+    }
+
+    // Initial fetch + periodic refresh
+    fetchStatus();
+    setInterval(fetchStatus, REFRESH_INTERVAL_MS);
+  </script>
+</body>
+</html>
