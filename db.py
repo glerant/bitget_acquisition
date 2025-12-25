@@ -563,3 +563,93 @@ class DBManager:
                 cur.execute(sql, params)
 
         self._call_with_resilience("update_pipeline_status", _impl)
+
+    def ensure_prune_indexes(self) -> None:
+        """
+        Ensure an index exists on ts_exchange for fast pruning.
+        Safe to call repeatedly.
+        """
+
+        def _impl() -> None:
+            with self.cursor() as cur:
+                # MariaDB doesn't support CREATE INDEX IF NOT EXISTS in all versions,
+                # so we check information_schema.
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'trades_raw'
+                    AND INDEX_NAME = 'idx_trades_time';
+                    """
+                )
+                n = int(cur.fetchone()["n"])
+                if n == 0:
+                    logger.info(
+                        "Creating idx_trades_time on trades_raw(ts_exchange) for pruning."
+                    )
+                    cur.execute(
+                        "CREATE INDEX idx_trades_time ON trades_raw (ts_exchange);"
+                    )
+                else:
+                    logger.debug("Index idx_trades_time already exists.")
+
+        self._call_with_resilience("ensure_prune_indexes", _impl)
+
+    def prune_trades_older_than_days(
+        self,
+        *,
+        days: int,
+        batch_size: int = 50_000,
+        max_batches: int = 200,
+    ) -> int:
+        """
+        Delete trades older than `days` in batches.
+        Returns total rows deleted.
+
+        - batch_size keeps transactions small
+        - max_batches prevents runaway deletes on startup
+        """
+        if days <= 0:
+            raise ValueError("days must be > 0")
+
+        def _impl() -> int:
+            total_deleted = 0
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+            with self.cursor() as cur:
+                for i in range(max_batches):
+                    cur.execute(
+                        """
+                        DELETE FROM trades_raw
+                        WHERE ts_exchange < %s
+                        LIMIT %s
+                        """,
+                        (cutoff, batch_size),
+                    )
+                    deleted = cur.rowcount or 0
+                    total_deleted += deleted
+
+                    if deleted == 0:
+                        break
+
+            return total_deleted
+
+        deleted = self._call_with_resilience("prune_trades_older_than_days", _impl)
+        return deleted
+
+    def get_lock(self, name: str, timeout_sec: int = 0) -> bool:
+        def _impl() -> bool:
+            with self.cursor() as cur:
+                cur.execute("SELECT GET_LOCK(%s, %s) AS got", (name, timeout_sec))
+                row = cur.fetchone()
+                return bool(row and row.get("got"))
+
+        return self._call_with_resilience("get_lock", _impl)
+
+    def release_lock(self, name: str) -> None:
+        def _impl() -> None:
+            with self.cursor() as cur:
+                cur.execute("SELECT RELEASE_LOCK(%s) AS rel", (name,))
+
+        self._call_with_resilience("release_lock", _impl)

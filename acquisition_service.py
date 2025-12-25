@@ -452,7 +452,7 @@ class AcquisitionService:
 
     def run_live_loop(self) -> None:
         """
-        Simple synchronous live loop polling klines/trades/orderbook.
+        Simple synchronous live loop polling klines/trades/orderbook + periodic trade pruning.
         """
         acq = self.cfg.acquisition
         intervals = acq.live_poll_intervals
@@ -461,8 +461,15 @@ class AcquisitionService:
         next_trade_poll = time.time()
         next_ob_poll = time.time()
 
+        # --- pruning schedule ---
+        PRUNE_EVERY_SEC = 6 * 3600  # every 6 hours (change to 24*3600 if you prefer)
+        next_prune = time.time()  # run immediately on startup
+
         logger.info(
-            "Starting live acquisition loop for market_type=%s", self.client.market_type
+            "Starting live acquisition loop for market_type=%s (prune_every=%ds, trade_history_days=%d)",
+            self.client.market_type,
+            PRUNE_EVERY_SEC,
+            acq.trade_history_days,
         )
 
         while True:
@@ -479,6 +486,49 @@ class AcquisitionService:
             if acq.enable_orderbook and now >= next_ob_poll:
                 self._poll_orderbook_live()
                 next_ob_poll = now + intervals.orderbook_seconds
+
+            # --- periodic pruning of trades_raw ---
+            if acq.enable_trades and now >= next_prune:
+                lock_name = "prune_trades_raw"
+                got_lock = False
+                try:
+                    got_lock = self.db.get_lock(lock_name, timeout_sec=0)
+                    if got_lock:
+                        logger.info(
+                            "Prune tick (market_type=%s): starting prune run...",
+                            self.client.market_type,
+                        )
+                        self.db.ensure_prune_indexes()
+                        deleted = self.db.prune_trades_older_than_days(
+                            days=acq.trade_history_days,
+                            batch_size=50_000,
+                            max_batches=200,
+                        )
+                        logger.info(
+                            "Prune tick: deleted=%d rows older than %d days",
+                            deleted,
+                            acq.trade_history_days,
+                        )
+                    else:
+                        logger.debug(
+                            "Prune tick (market_type=%s): skipped (another process holds lock)",
+                            self.client.market_type,
+                        )
+                except Exception:
+                    logger.exception("Periodic trade pruning failed")
+                finally:
+                    if got_lock:
+                        try:
+                            self.db.release_lock(lock_name)
+                        except Exception:
+                            logger.exception("Failed to release prune lock")
+
+                next_prune = now + PRUNE_EVERY_SEC
+                logger.info(
+                    "Next prune scheduled in %d seconds (at unix=%.0f)",
+                    PRUNE_EVERY_SEC,
+                    next_prune,
+                )
 
             time.sleep(0.5)
 
