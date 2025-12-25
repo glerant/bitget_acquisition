@@ -1,0 +1,19 @@
+{
+  "version": "0.1.0",
+  "db": {
+    "host": "",
+    "port": 3306,
+    "user": "",
+    "password": "",
+    "database": "bitget_pipeline"
+},
+  "feature": {
+    "timeframes": ["1m"],         
+    "backfill_chunk_symbols": 10,  
+    "live_poll_interval_seconds": 10,
+    "max_indicator_lookback": 200  
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}

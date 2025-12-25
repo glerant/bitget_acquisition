@@ -18,6 +18,34 @@ logger = logging.getLogger("dashboard")
 CONFIG_PATH = os.environ.get("ACQ_CONFIG_PATH", "config.json")
 cfg = load_config(CONFIG_PATH)
 
+# Same mapping concept as acquisition_service.py
+INTERVAL_MS = {
+    "1m": 60_000,
+    "3m": 3 * 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
+    "1h": 60 * 60_000,
+    "2h": 2 * 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "6h": 6 * 60 * 60_000,
+    "12h": 12 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+    "3d": 3 * 24 * 60 * 60_000,
+    "1w": 7 * 24 * 60 * 60_000,
+    "1M": 30 * 24 * 60 * 60_000,
+}
+
+
+def last_completed_kline_open_time(now_utc: datetime, interval_ms: int) -> datetime:
+    """
+    Returns open_time of the last fully completed candle.
+    """
+    now_ms = int(now_utc.timestamp() * 1000)
+    end_ms = ((now_ms // interval_ms) * interval_ms) - interval_ms
+    end_ms = max(end_ms, 0)
+    return datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)
+
 
 # ---------------------------------------------------------------------
 # DB helpers
@@ -74,6 +102,12 @@ def fetch_pipeline_status() -> Tuple[List[Dict[str, Any]], Optional[str]]:
 
     now = datetime.now(timezone.utc)
 
+    kline_interval = cfg.acquisition.kline_interval
+    step_ms = INTERVAL_MS.get(kline_interval)
+    expected_kline_open = (
+        last_completed_kline_open_time(now, step_ms) if step_ms else None
+    )
+
     for row in rows:
         # Normalise datetimes as UTC (MariaDB often returns naive datetimes)
         for key in [
@@ -94,6 +128,28 @@ def fetch_pipeline_status() -> Tuple[List[Dict[str, Any]], Optional[str]]:
                 row[age_key] = None
             else:
                 row[age_key] = (now - dt).total_seconds()
+
+            # --- Kline lag vs expected last completed candle ---
+            row["kline_expected_open_time"] = expected_kline_open
+
+            if expected_kline_open is None or row.get("kline_last_time") is None:
+                row["kline_lag_sec"] = None
+                row["kline_lag_candles"] = None
+                row["kline_health"] = "unknown"
+            else:
+                lag_sec = (expected_kline_open - row["kline_last_time"]).total_seconds()
+                if lag_sec < 0:
+                    lag_sec = 0  # clock skew / exchange oddness protection
+                row["kline_lag_sec"] = lag_sec
+                row["kline_lag_candles"] = int(lag_sec // (step_ms / 1000))
+
+                # Health thresholds (tune as you like)
+                if row["kline_lag_candles"] <= 1:
+                    row["kline_health"] = "ok"
+                elif row["kline_lag_candles"] <= 3:
+                    row["kline_health"] = "warn"
+                else:
+                    row["kline_health"] = "error"
 
     return rows, None
 
@@ -130,16 +186,22 @@ def api_pipeline_status():
                 "version": r["version"],
                 "sync_status": r["sync_status"],
                 "request_status": r["request_status"],
-                # Start times (formatted)
+                # --- Kline times ---
                 "kline_start_time": fmt_ts(r["kline_start_time"]),
-                "trade_start_time": fmt_ts(r["trade_start_time"]),
-                # Last times (formatted, compact)
                 "kline_last_time": fmt_ts(r["kline_last_time"]),
+                "kline_expected_open_time": fmt_ts(r.get("kline_expected_open_time")),
+                # --- Trade times ---
+                "trade_start_time": fmt_ts(r["trade_start_time"]),
                 "trade_last_time": fmt_ts(r["trade_last_time"]),
+                # --- Meta ---
                 "last_updated": fmt_ts(r["last_updated"]),
-                # Ages for staleness logic
+                # --- Legacy age (keep for now, optional) ---
                 "kline_last_time_age_sec": r["kline_last_time_age_sec"],
                 "trade_last_time_age_sec": r["trade_last_time_age_sec"],
+                # --- New health / lag fields ---
+                "kline_lag_sec": r.get("kline_lag_sec"),
+                "kline_lag_candles": r.get("kline_lag_candles"),
+                "kline_health": r.get("kline_health"),
             }
         )
 

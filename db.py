@@ -44,6 +44,7 @@ class DBManager:
             database=self.config.database,
             cursorclass=DictCursor,
             autocommit=False,
+            init_command="SET time_zone = '+00:00'",
         )
 
     @contextmanager
@@ -461,6 +462,29 @@ class DBManager:
                 return row["exchange_trade_id"] if row else None
 
         return self._call_with_resilience("get_last_trade_id", _impl)
+
+    def get_last_trade_time(self, symbol_id: int) -> Optional[datetime]:
+        def _impl() -> Optional[datetime]:
+            with self.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ts_exchange
+                    FROM trades_raw
+                    WHERE symbol_id = %s
+                    ORDER BY ts_exchange DESC
+                    LIMIT 1;
+                    """,
+                    (symbol_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                dt = row["ts_exchange"]
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+
+        return self._call_with_resilience("get_last_trade_time", _impl)
 
     def ensure_pipeline_status_row(
         self,

@@ -2,12 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Bitget Acquisition Pipeline Status</title>
+  <title>Feature Service Status</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-
-  <!-- If you *really* want hard HTML refresh too, uncomment this:
-  <meta http-equiv="refresh" content="60">
-  -->
 
   <style>
     body {
@@ -156,23 +152,17 @@
       font-size: 0.8rem;
       opacity: 0.7;
     }
-
-    /* NEW: per-row kline health pill */
-    .health-pill-ok   { background: #093022; color: #6cf5b2; }
-    .health-pill-warn { background: #3b2b12; color: #ffd47f; }
-    .health-pill-err  { background: #3b1218; color: #ff9ba9; }
-    .health-pill-unk  { background: #202943; color: #9db8ff; }
   </style>
 </head>
 <body>
   <div class="header">
     <div>
-      <h1>Acquisition Pipeline Status</h1>
+      <h1>Feature Service Status</h1>
       <div class="meta">
-        Pipeline version:
-        <strong id="pipeline-version">{{ app_version }}</strong> ·
-        auto_gap_backfill_minutes:
-        <strong id="gap-minutes">{{ auto_gap_backfill_minutes }}</strong>
+        Feature version:
+        <strong id="feature-version">{{ feature_version }}</strong> ·
+        Timeframes:
+        <strong id="feature-timeframes">{{ timeframes }}</strong>
       </div>
     </div>
     <div id="global-health" class="health-bar health-warn">
@@ -203,12 +193,8 @@
       <span id="stat-error" class="stat-value">0</span>
     </div>
     <div class="stat-pill">
-      <span class="stat-label">Kline not-ok</span>
-      <span id="stat-kline-bad" class="stat-value">0</span>
-    </div>
-    <div class="stat-pill">
-      <span class="stat-label">Trade stale</span>
-      <span id="stat-trade-stale" class="stat-value">0</span>
+      <span class="stat-label">Feature stale</span>
+      <span id="stat-stale" class="stat-value">0</span>
     </div>
     <div class="stat-pill">
       <span class="stat-label">Last refresh</span>
@@ -222,13 +208,11 @@
     <thead>
       <tr>
         <th>Symbol</th>
+        <th>Market</th>
         <th>Sync</th>
         <th>Request</th>
-        <th>Kline last time</th>
-        <th>Kline lag</th>
-        <th>Kline health</th>
-        <th>Trade last time</th>
-        <th>Trade age</th>
+        <th>Last feature time</th>
+        <th>Age</th>
         <th>Row last_updated</th>
       </tr>
     </thead>
@@ -238,32 +222,32 @@
   </table>
 
   <p class="footer-note">
-    Trade staleness threshold (in JS): 60 s.
-    Adjust in <code>dashboard.html</code> as needed.
+    Staleness threshold (in JS): 300 s for features. Adjust in <code>feature_dashboard.html</code> as needed.
   </p>
 
   <script>
     const REFRESH_INTERVAL_MS = 5000;       // 5 seconds
-    const TRADE_STALE_THRESHOLD = 60;       // 60 seconds
+    const FEATURE_STALE_THRESHOLD = 300;    // 300 seconds (5 minutes)
 
     async function fetchStatus() {
       const errorBanner = document.getElementById("error-banner");
       try {
-        const res = await fetch("/api/pipeline_status", { cache: "no-store" });
+        const res = await fetch("/api/feature_status", { cache: "no-store" });
         if (!res.ok) {
           throw new Error("HTTP " + res.status);
         }
         const data = await res.json();
 
-        // Update header meta (version, gap minutes) from API
+        // Update header meta from API
         if (data.version !== undefined) {
-          document.getElementById("pipeline-version").textContent = data.version;
+          document.getElementById("feature-version").textContent = data.version;
         }
-        if (data.auto_gap_backfill_minutes !== undefined) {
-          document.getElementById("gap-minutes").textContent = data.auto_gap_backfill_minutes;
+        if (data.timeframes !== undefined) {
+          document.getElementById("feature-timeframes").textContent =
+            Array.isArray(data.timeframes) ? data.timeframes.join(", ") : data.timeframes;
         }
 
-        // Error banner from backend (e.g., DB issue)
+        // Backend error (e.g., DB down)
         if (data.error) {
           errorBanner.textContent = data.error;
           errorBanner.style.display = "block";
@@ -276,14 +260,13 @@
         renderTable(symbols);
         renderStats(symbols);
 
-        // Last refresh time (local)
         const now = new Date();
         document.getElementById("stat-last-refresh").textContent =
           now.toLocaleTimeString();
 
       } catch (err) {
         console.error("Fetch error:", err);
-        errorBanner.textContent = "Failed to fetch pipeline status: " + err;
+        errorBanner.textContent = "Failed to fetch feature status: " + err;
         errorBanner.style.display = "block";
       }
     }
@@ -293,69 +276,32 @@
       tbody.innerHTML = "";
 
       for (const r of symbols) {
-        const tAgeSec = r.trade_last_time_age_sec;
-        const tStale = tAgeSec !== null && tAgeSec > TRADE_STALE_THRESHOLD;
+        const ageSec = r.kline_feature_last_time_age_sec;
+        const stale = ageSec !== null && ageSec > FEATURE_STALE_THRESHOLD;
 
-        const tAgeStr = tAgeSec === null
+        const ageStr = ageSec === null
           ? "n/a"
-          : Math.floor(tAgeSec) + " s";
-
-        // New kline fields from API
-        const kLagCandles = r.kline_lag_candles;
-        const kLagSec = r.kline_lag_sec;
-        const kHealth = (r.kline_health || "unknown").toLowerCase();
-
-        let kLagStr = "n/a";
-        if (kLagCandles !== null && kLagCandles !== undefined) {
-          kLagStr = `${kLagCandles} candles`;
-        } else if (kLagSec !== null && kLagSec !== undefined) {
-          kLagStr = `${Math.floor(kLagSec)} s`;
-        }
+          : Math.floor(ageSec) + " s";
 
         const syncClass = "sync-" + (r.sync_status || "pending");
         const reqClass = "req-" + (r.request_status || "idle");
 
-        // Compact market label
-        let marketLabel = "";
-        if (r.market_type === "spot") {
-          marketLabel = "spot";
-        } else if (r.market_type === "futures") {
-          marketLabel = "perp";
-        } else if (r.market_type) {
-          marketLabel = r.market_type;
-        }
-
-        const symbolCell = marketLabel
-          ? `${r.symbol} <span class="small">(${marketLabel})</span>`
-          : r.symbol;
-
-        let kHealthPill = '<span class="status-pill health-pill-unk">unknown</span>';
-        if (kHealth === "ok") {
-          kHealthPill = '<span class="status-pill health-pill-ok">ok</span>';
-        } else if (kHealth === "warn") {
-          kHealthPill = '<span class="status-pill health-pill-warn">warn</span>';
-        } else if (kHealth === "error") {
-          kHealthPill = '<span class="status-pill health-pill-err">error</span>';
-        }
-
         const tr = document.createElement("tr");
         tr.innerHTML = `
-          <td>${symbolCell}</td>
+          <td>${r.symbol ?? "–"}</td>
+          <td>${r.market_type ?? "–"}</td>
           <td>
             <span class="status-pill ${syncClass}">${r.sync_status}</span>
           </td>
           <td>
             <span class="status-pill ${reqClass}">${r.request_status}</span>
           </td>
-          <td>${r.kline_last_time ?? "–"}</td>
-          <td class="age">${kLagStr}</td>
-          <td>${kHealthPill}</td>
-          <td>${r.trade_last_time ?? "–"}</td>
+          <td>${r.kline_feature_last_time ?? "–"}</td>
           <td class="age">
             ${
-              tAgeSec === null
+              ageSec === null
                 ? '<span class="small">n/a</span>'
-                : `<span class="${tStale ? "stale-yes" : "stale-no"}">${tAgeStr}</span>`
+                : `<span class="${stale ? "stale-yes" : "stale-no"}">${ageStr}</span>`
             }
           </td>
           <td>${r.last_updated ?? "–"}</td>
@@ -370,9 +316,7 @@
       let running = 0;
       let pending = 0;
       let error = 0;
-      let kBadCount = 0;     // warn/error/unknown
-      let kErrCount = 0;     // error only
-      let tStaleCount = 0;
+      let staleCount = 0;
 
       for (const r of symbols) {
         if (r.sync_status === "ok" && r.request_status === "live") {
@@ -388,17 +332,9 @@
           error += 1;
         }
 
-        const kHealth = (r.kline_health || "unknown").toLowerCase();
-        if (kHealth !== "ok") {
-          kBadCount += 1;
-        }
-        if (kHealth === "error") {
-          kErrCount += 1;
-        }
-
-        const tAgeSec = r.trade_last_time_age_sec;
-        if (tAgeSec === null || tAgeSec > TRADE_STALE_THRESHOLD) {
-          tStaleCount += 1;
+        const ageSec = r.kline_feature_last_time_age_sec;
+        if (ageSec !== null && ageSec > FEATURE_STALE_THRESHOLD) {
+            staleCount += 1;
         }
       }
 
@@ -407,29 +343,26 @@
       document.getElementById("stat-running").textContent = running;
       document.getElementById("stat-pending").textContent = pending;
       document.getElementById("stat-error").textContent = error;
-      document.getElementById("stat-kline-bad").textContent = kBadCount;
-      document.getElementById("stat-trade-stale").textContent = tStaleCount;
+      document.getElementById("stat-stale").textContent = staleCount;
 
-      // Global health logic:
       const healthDiv = document.getElementById("global-health");
       const healthText = document.getElementById("global-health-text");
 
-      // Default: warn
       let healthClass = "health-warn";
       let text = "Degraded";
 
       if (total === 0) {
         healthClass = "health-warn";
         text = "No symbols";
-      } else if (error > 0 || kErrCount > 0) {
+      } else if (error > 0) {
         healthClass = "health-bad";
         text = "Errors present";
-      } else if (kBadCount === 0 && tStaleCount === 0 && running === 0 && pending === 0) {
+      } else if (staleCount === 0 && running === 0 && pending === 0) {
         healthClass = "health-ok";
         text = "Healthy";
-      } else if (kBadCount === total || tStaleCount === total) {
+      } else if (staleCount === total) {
         healthClass = "health-bad";
-        text = "All unhealthy";
+        text = "All stale";
       } else {
         healthClass = "health-warn";
         text = "Mixed";
@@ -440,7 +373,6 @@
       healthText.textContent = text;
     }
 
-    // Initial fetch + periodic refresh
     fetchStatus();
     setInterval(fetchStatus, REFRESH_INTERVAL_MS);
   </script>

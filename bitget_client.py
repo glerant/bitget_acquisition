@@ -315,6 +315,49 @@ class BitgetClient:
         data = rsp.get("data", [])
         return data
 
+    def fetch_trades_history(
+        self,
+        symbol: str,
+        start: int,
+        end: int,
+        limit: int = 1000,
+        id_less_than: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch historical public trades within a time window, with pagination.
+
+        Uses:
+        - spot: /api/v2/spot/market/fills-history
+        - futures: /api/v2/mix/market/fills-history
+
+        Note: Bitget limits the time window to <= 7 days per request.
+        Pagination uses idLessThan to go older.
+        """
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "limit": str(limit),
+            "startTime": str(start),
+            "endTime": str(end),
+        }
+        if id_less_than is not None:
+            params["idLessThan"] = str(id_less_than)
+
+        if self.market_type == "futures":
+            params["productType"] = self.futures_product_type
+
+        rsp = self._call_with_resilience(
+            f"fills-history {symbol}",
+            lambda: self.market.fills_history(params),
+        )
+
+        code = rsp.get("code")
+        if code != "00000":
+            logger.error("Bitget fills-history error for %s: %s", symbol, rsp)
+            raise RuntimeError(f"Bitget fills-history error: {rsp}")
+
+        data = rsp.get("data", [])
+        return data
+
     def fetch_orderbook(
         self,
         symbol: str,

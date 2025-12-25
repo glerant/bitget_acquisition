@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>CeX Live Candles</title>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        margin: 0;
+        padding: 0;
+        background: #111;
+        color: #eee;
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        padding: 0.75rem 1rem;
+        background: #181818;
+        border-bottom: 1px solid #333;
+        flex-wrap: wrap;
+      }
+
+      label {
+        font-size: 0.9rem;
+      }
+
+      select {
+        background: #000;
+        color: #eee;
+        border: 1px solid #444;
+        padding: 0.25rem 0.5rem;
+        border-radius: 4px;
+      }
+
+      #chart {
+        width: 100%;
+        height: calc(100vh - 52px);
+      }
+
+      .status {
+        margin-left: auto;
+        font-size: 0.8rem;
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="toolbar">
+      <div>
+        <label for="symbolSelect">Market:</label>
+        <select id="symbolSelect">
+          {% for m in markets %}
+          <option
+            value="{{ m.value }}"
+            {% if m.value == default_market %}selected{% endif %}
+          >
+            {{ m.label }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label for="timeframeSelect">Duration / Timeframe:</label>
+        <select id="timeframeSelect">
+          {% for tf in timeframes %}
+          <option
+            value="{{ tf }}"
+            {% if tf == default_timeframe %}selected{% endif %}
+          >
+            {{ tf }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label for="limitInput">Candles:</label>
+        <select id="limitInput">
+          {% set limits = [100, 200, 300, 500, 1000] %}
+          {% for lim in limits %}
+          <option
+            value="{{ lim }}"
+            {% if lim == default_limit %}selected{% endif %}
+          >
+            {{ lim }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label for="featureSelect">Feature overlay:</label>
+        <select id="featureSelect">
+          {% for key, label in features %}
+          <option
+            value="{{ key }}"
+            {% if key == default_feature %}selected{% endif %}
+          >
+            {{ label }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="status" id="statusText">Loading…</div>
+    </div>
+
+    <div id="chart"></div>
+
+    <script>
+      const symbolSelect = document.getElementById("symbolSelect");
+      const timeframeSelect = document.getElementById("timeframeSelect");
+      const limitInput = document.getElementById("limitInput");
+      const featureSelect = document.getElementById("featureSelect");
+      const statusText = document.getElementById("statusText");
+      const chartDiv = document.getElementById("chart");
+
+      const REFRESH_MS = 10000; // 10 seconds
+
+      function parseSelectedMarket() {
+        // value is "BTCUSDT::spot"
+        const raw = symbolSelect.value || "";
+        const parts = raw.split("::");
+        return {
+          symbol: parts[0] || "BTCUSDT",
+          market_type: parts[1] || "spot",
+        };
+      }
+
+      async function fetchCandles() {
+        const { symbol, market_type } = parseSelectedMarket();
+
+        const params = new URLSearchParams({
+          symbol: symbol,
+          market_type: market_type,
+          timeframe: timeframeSelect.value,
+          limit: limitInput.value,
+          feature: featureSelect.value,
+        });
+
+        const url = "/api/candles?" + params.toString();
+
+        try {
+          statusText.textContent = "Updating…";
+          const res = await fetch(url);
+          if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(errText || res.statusText);
+          }
+          const data = await res.json();
+          statusText.textContent =
+            "Last update: " + new Date().toLocaleTimeString();
+          return data;
+        } catch (err) {
+          console.error(err);
+          statusText.textContent = "Error: " + err.message;
+          return null;
+        }
+      }
+
+      function buildLayout(symbolDisplay, timeframe) {
+        return {
+          paper_bgcolor: "#111",
+          plot_bgcolor: "#111",
+          dragmode: "zoom",
+          showlegend: true,
+          legend: {
+            bgcolor: "#111",
+            font: { color: "#eee" },
+          },
+          margin: { t: 30, r: 40, b: 40, l: 60 },
+          grid: { rows: 2, columns: 1, roworder: "top to bottom" },
+
+          xaxis: {
+            type: "date",
+            rangeslider: { visible: false },
+            showgrid: true,
+            gridcolor: "#333",
+            showline: true,
+            linecolor: "#555",
+            tickfont: { color: "#aaa" },
+          },
+          yaxis: {
+            domain: [0.32, 1],
+            title: { text: symbolDisplay + " Price", font: { color: "#ddd" } },
+            showgrid: true,
+            gridcolor: "#333",
+            tickfont: { color: "#aaa" },
+          },
+
+          xaxis2: {
+            type: "date",
+            matches: "x",
+            showgrid: false,
+            showline: true,
+            linecolor: "#555",
+            tickfont: { color: "#aaa" },
+          },
+          yaxis2: {
+            domain: [0, 0.25],
+            title: { text: "Volume", font: { color: "#ddd" } },
+            showgrid: true,
+            gridcolor: "#222",
+            tickfont: { color: "#aaa" },
+          },
+
+          title: {
+            text: `${symbolDisplay} (${timeframe})`,
+            x: 0.02,
+            xanchor: "left",
+            font: { color: "#eee", size: 16 },
+          },
+        };
+      }
+
+      async function drawChart() {
+        const data = await fetchCandles();
+        if (!data) return;
+
+        const times = data.times;
+        const opens = data.opens;
+        const highs = data.highs;
+        const lows = data.lows;
+        const closes = data.closes;
+        const volumes = data.volumes;
+        const featureValues = data.feature_values || [];
+        const featureLabel = data.feature_label || "Feature";
+        const symbolDisplay = data.symbol_display || data.symbol;
+
+        const candleTrace = {
+          type: "candlestick",
+          name: "Price",
+          x: times,
+          open: opens,
+          high: highs,
+          low: lows,
+          close: closes,
+          xaxis: "x",
+          yaxis: "y",
+          increasing: { line: { color: "#26a69a" } },
+          decreasing: { line: { color: "#ef5350" } },
+        };
+
+        const volumeTrace = {
+          type: "bar",
+          name: "Volume",
+          x: times,
+          y: volumes,
+          xaxis: "x2",
+          yaxis: "y2",
+          opacity: 0.5,
+        };
+
+        const traces = [candleTrace, volumeTrace];
+
+        if (featureValues && featureValues.length) {
+          const featureTrace = {
+            type: "scatter",
+            mode: "lines",
+            name: featureLabel,
+            x: times,
+            y: featureValues,
+            xaxis: "x",
+            yaxis: "y",
+            line: { width: 1.5 },
+          };
+          traces.push(featureTrace);
+        }
+
+        const layout = buildLayout(symbolDisplay, data.timeframe);
+
+        Plotly.react(chartDiv, traces, layout, {
+          responsive: true,
+        });
+      }
+
+      // Update when controls change
+      symbolSelect.addEventListener("change", drawChart);
+      timeframeSelect.addEventListener("change", () => {
+        // Optional: auto-reset feature if not 1m
+        if (timeframeSelect.value !== "1m" && featureSelect.value !== "none") {
+          featureSelect.value = "none";
+        }
+        drawChart();
+      });
+      limitInput.addEventListener("change", drawChart);
+      featureSelect.addEventListener("change", drawChart);
+
+      // Initial draw
+      drawChart();
+
+      // Auto refresh every 10 seconds
+      setInterval(drawChart, REFRESH_MS);
+    </script>
+  </body>
+</html>

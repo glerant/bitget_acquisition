@@ -11,7 +11,6 @@ from bitget_client import BitgetClient
 from db import DBManager
 from resilience import OutageExceededError
 
-
 logger = logging.getLogger(__name__)
 
 # Map our internal interval string to milliseconds
@@ -93,13 +92,6 @@ class AcquisitionService:
         """
         Make sure all configured symbols for this market exist in the DB and
         build a mapping.
-
-        For spot:
-          - symbols like "BTCUSDT" -> base=BTC, quote=USDT
-
-        For futures/perps:
-          - symbols like "BTCUSDT_UMCBL" -> base=BTC, quote=USDT, stored
-            with market_type="futures" (client.market_type).
         """
         acq_market = self._current_market_cfg()
         market_type = self.client.market_type  # "spot" or "futures"
@@ -116,7 +108,6 @@ class AcquisitionService:
                 base = sym_core[:-4]
                 quote = "USDT"
             else:
-                # Fallback: store full sym_core as base, quote placeholder
                 base = sym_core
                 quote = "N/A"
 
@@ -136,67 +127,73 @@ class AcquisitionService:
                 quote,
             )
 
-            # Ensure pipeline_status row for this symbol/version
             self.db.ensure_pipeline_status_row(symbol_id, symbol, self.version)
 
     # -------------------------------------------------------------------------
-    # Backfill
+    # Backfill - Klines
     # -------------------------------------------------------------------------
 
-    def backfill_all(self) -> None:
+    def catchup_klines_to_now(self) -> None:
         """
-        Entry point for one-off backfill of all enabled data types.
-        """
-        acq = self.cfg.acquisition
-
-        if acq.enable_klines:
-            self.backfill_klines_all_symbols()
-
-        if acq.enable_trades:
-            self.backfill_trades_all_symbols()
-
-        # Orderbook has no historical REST, so we skip backfill for it.
-
-    def backfill_klines_all_symbols(self) -> None:
-        """
-        Backfill historical klines for all registered symbols using Bitget's
-        kline history.
+        Deterministic kline catch-up:
+          - If no existing klines: bootstrap from cfg.history_start (capped by max_history_days)
+          - Else: from (last_open_time + interval) to last fully-formed candle boundary.
         """
         acq = self.cfg.acquisition
+        if not acq.enable_klines:
+            return
+
         interval = acq.kline_interval
-        start_dt = iso_to_datetime(acq.history_start)
+        step_ms = INTERVAL_MS.get(interval)
+        if step_ms is None:
+            raise ValueError(f"Unsupported interval for catch-up: {interval!r}")
 
-        if acq.history_end:
-            end_dt = iso_to_datetime(acq.history_end)
-        else:
-            # A small safety margin to avoid hitting an in-progress bar
-            end_dt = datetime.now(timezone.utc) - timedelta(minutes=1)
+        now_utc = datetime.now(timezone.utc)
 
-        # Enforce max_history_days window if configured
+        # End at the LAST FULLY COMPLETED candle (exclude in-progress)
+        now_ms = self.client.datetime_to_ms(now_utc)
+        end_ms = ((now_ms // step_ms) * step_ms) - step_ms
+        end_ms = max(end_ms, 0)
+        end_dt = self.client.ms_to_datetime(end_ms)
+
+        cfg_start = iso_to_datetime(acq.history_start)
+
+        # Enforce max_history_days for bootstrap start
         max_days = acq.max_history_days
-        if (end_dt - start_dt).days > max_days:
-            start_dt = end_dt - timedelta(days=max_days)
-            logger.warning(
-                "history_start truncated to %s based on max_history_days=%d",
-                start_dt.isoformat(),
-                max_days,
-            )
+        min_start = end_dt - timedelta(days=max_days)
+        if cfg_start < min_start:
+            cfg_start = min_start
 
         for symbol, symbol_id in self.symbol_ids.items():
+            last_open = self.db.get_last_kline_open_time(symbol_id, interval)
+
+            if last_open is None:
+                start_dt = cfg_start
+                request_status = "backfill"
+                mode = "bootstrap"
+            else:
+                start_dt = last_open + timedelta(milliseconds=step_ms)
+                request_status = "gap_fill"
+                mode = "catchup"
+
+            if start_dt >= end_dt:
+                logger.info("Klines %s: nothing to do for %s", mode, symbol)
+                continue
+
             logger.info(
-                "Backfilling klines for %s (%s) from %s to %s",
+                "Klines %s for %s (%s): %s -> %s",
+                mode,
                 symbol,
                 interval,
-                start_dt,
-                end_dt,
+                start_dt.isoformat(),
+                end_dt.isoformat(),
             )
 
-            # Mark this symbol as running a kline backfill
             self.db.update_pipeline_status(
                 symbol_id,
                 version=self.version,
                 sync_status="running",
-                request_status="backfill",
+                request_status=request_status,
                 kline_start_time=start_dt,
             )
 
@@ -204,7 +201,6 @@ class AcquisitionService:
                 symbol, symbol_id, interval, start_dt, end_dt
             )
 
-            # After backfill, record the latest kline open_time from DB
             last_kline = self.db.get_last_kline_open_time(symbol_id, interval)
             self.db.update_pipeline_status(
                 symbol_id,
@@ -225,34 +221,19 @@ class AcquisitionService:
         """
         Walk through the given time range, requesting klines in batches via
         BitgetClient.fetch_klines, and inserting them into the DB.
-
-        For futures/perps in particular, Bitget requires that the time window
-        [startTime, endTime] per request is not too large, so we bound each
-        request to roughly 'batch_size' intervals.
         """
         acq = self.cfg.acquisition
         batch_size = acq.kline_batch_size
 
         step_ms = INTERVAL_MS.get(interval)
-        if step_ms is None:
-            # Fall back to "old" behaviour if interval is unknown
-            logger.warning(
-                "Unknown interval %r, using unbounded time window in backfill (may hit API limits)",
-                interval,
-            )
-            cur_start = self.client.datetime_to_ms(start_dt)
-            end_ms = self.client.datetime_to_ms(end_dt)
-        else:
-            cur_start = self.client.datetime_to_ms(start_dt)
-            end_ms = self.client.datetime_to_ms(end_dt)
+        cur_start = self.client.datetime_to_ms(start_dt)
+        end_ms = self.client.datetime_to_ms(end_dt)
 
         while cur_start < end_ms:
             if step_ms is not None:
-                # Limit each request to at most batch_size * interval duration
                 window_ms = batch_size * step_ms
                 batch_end = min(cur_start + window_ms - 1, end_ms)
             else:
-                # Unknown interval: request full configured range
                 batch_end = end_ms
 
             klines_raw = self.client.fetch_klines(
@@ -277,209 +258,192 @@ class AcquisitionService:
             for raw in klines_raw:
                 parsed = self._parse_kline_raw(symbol_id, interval, raw)
                 if parsed is None:
-                    # Malformed kline; already logged
+                    continue
+
+                if parsed["open_time"] > end_dt:
                     continue
 
                 rows_for_db.append(parsed)
+
                 ts_ms = int(raw[0])
                 if ts_ms > max_time_ms:
                     max_time_ms = ts_ms
 
             if rows_for_db:
+                rows_for_db.sort(key=lambda r: r["open_time"])
                 self.db.bulk_upsert_klines(rows_for_db)
-                logger.info("Inserted %d klines for %s", len(rows_for_db), symbol)
+                logger.info(
+                    "Inserted %d klines for %s (batch %s -> %s)",
+                    len(rows_for_db),
+                    symbol,
+                    rows_for_db[0]["open_time"].isoformat(),
+                    rows_for_db[-1]["open_time"].isoformat(),
+                )
 
             if max_time_ms <= cur_start:
-                # Prevent infinite loop if something weird happens
                 logger.warning(
                     "max_time_ms <= cur_start for %s; advancing by one interval to avoid loop",
                     symbol,
                 )
-                if step_ms is not None:
-                    cur_start += step_ms
-                else:
-                    cur_start += 60_000  # fallback: 1 minute
+                cur_start += step_ms if step_ms is not None else 60_000
             else:
                 cur_start = max_time_ms + 1
 
-            time.sleep(0.2)  # Small pause to be nice to the API
+            time.sleep(0.2)
 
-    def backfill_recent_kline_gaps(self) -> None:
-        """
-        On startup, check the latest kline per symbol and backfill any
-        recent gap between that point and 'now', if the gap exceeds
-        auto_gap_backfill_minutes.
-        """
-        acq = self.cfg.acquisition
-        if not acq.enable_klines:
-            return
-
-        if acq.auto_gap_backfill_minutes <= 0:
-            logger.info("auto_gap_backfill_minutes <= 0; skipping gap backfill check")
-            return
-
-        interval = acq.kline_interval
-        now_utc = datetime.now(timezone.utc)
-        gap_threshold = timedelta(minutes=acq.auto_gap_backfill_minutes)
-
-        for symbol, symbol_id in self.symbol_ids.items():
-            last_open_time = self.db.get_last_kline_open_time(symbol_id, interval)
-
-            if last_open_time is None:
-                logger.info(
-                    "No existing klines for %s; skipping gap backfill (use full backfill instead)",
-                    symbol,
-                )
-                continue
-
-            gap = now_utc - last_open_time
-            if gap <= gap_threshold:
-                logger.info(
-                    "Kline gap for %s is %s (<= %s); no gap backfill needed",
-                    symbol,
-                    gap,
-                    gap_threshold,
-                )
-                continue
-
-            # Backfill from last_open_time up to now; UPSERT is safe
-            start_dt = last_open_time
-            end_dt = now_utc - timedelta(minutes=1)
-
-            logger.info(
-                "Detected kline gap for %s: last=%s, now=%s, gap=%s > %s; backfilling...",
-                symbol,
-                last_open_time.isoformat(),
-                now_utc.isoformat(),
-                gap,
-                gap_threshold,
-            )
-
-            self.db.update_pipeline_status(
-                symbol_id,
-                version=self.version,
-                sync_status="running",
-                request_status="gap_fill",
-                kline_start_time=start_dt,
-            )
-
-            self._backfill_klines_for_symbol(
-                symbol, symbol_id, interval, start_dt, end_dt
-            )
-
-            last_kline = self.db.get_last_kline_open_time(symbol_id, interval)
-            self.db.update_pipeline_status(
-                symbol_id,
-                version=self.version,
-                sync_status="ok",
-                request_status="idle",
-                kline_last_time=last_kline,
-            )
+    # -------------------------------------------------------------------------
+    # Backfill - Trades
+    # -------------------------------------------------------------------------
 
     def backfill_trades_all_symbols(self) -> None:
         """
         Optional: backfill trades up to Bitget's allowed history.
-        This implementation is deliberately conservative and just pulls
-        a limited number of recent batches per symbol.
+        Conservative implementation pulls limited windows per symbol.
         """
         acq = self.cfg.acquisition
         for symbol, symbol_id in self.symbol_ids.items():
             logger.info("Backfilling trades for %s", symbol)
             self._backfill_trades_for_symbol(symbol, symbol_id, acq.trade_batch_size)
 
-    def _backfill_trades_for_symbol(
-        self,
-        symbol: str,
-        symbol_id: int,
-        batch_size: int,
-    ) -> None:
+    def _trade_catchup_start(self, symbol_id: int) -> datetime:
         """
-        Backfill recent trades only, capped by cfg.acquisition.trade_history_days.
-
-        This prevents multi-year crawl times and keeps only execution-relevant data
-        (e.g. last 30–180 days of microstructure).
+        Determine starting timestamp for trade catch-up.
+        If we have existing trades, start from the last stored ts_exchange.
+        Otherwise start from now - trade_history_days.
         """
         acq = self.cfg.acquisition
-
         now_utc = datetime.now(timezone.utc)
-        cutoff_dt = now_utc - timedelta(days=acq.trade_history_days)
+        cutoff = now_utc - timedelta(days=acq.trade_history_days)
+
+        last_ts = self.db.get_last_trade_time(symbol_id)
+        if last_ts is None:
+            return cutoff
+        return max(last_ts, cutoff)
+
+    def _backfill_trades_for_symbol(
+        self, symbol: str, symbol_id: int, batch_size: int
+    ) -> None:
+        """
+        Deterministic trade backfill using fills-history:
+        - Catch up from DB watermark to now (bounded by trade_history_days)
+        - Query in <=7 day windows
+        - Page older within each window using idLessThan
+        """
+        acq = self.cfg.acquisition
+        now_utc = datetime.now(timezone.utc)
+
+        start_dt = self._trade_catchup_start(symbol_id)
+        end_dt = now_utc - timedelta(seconds=2)
+
+        if start_dt >= end_dt:
+            logger.info(
+                "Trades catch-up: nothing to do for %s (start=%s end=%s)",
+                symbol,
+                start_dt,
+                end_dt,
+            )
+            return
 
         logger.info(
-            "Backfilling trades for %s (last %d days, cutoff=%s)",
+            "Backfilling trades for %s using history (start=%s end=%s, history_days=%d)",
             symbol,
+            start_dt.isoformat(),
+            end_dt.isoformat(),
             acq.trade_history_days,
-            cutoff_dt.isoformat(),
         )
 
-        # Mark this symbol as running trade backfill
         self.db.update_pipeline_status(
             symbol_id,
             version=self.version,
             sync_status="running",
             request_status="backfill",
-            trade_start_time=cutoff_dt,
+            trade_start_time=start_dt,
         )
 
-        max_batches = 10_000  # safety upper bound so we never loop forever
-        batches_done = 0
+        window = timedelta(days=7)
+        cur_start = start_dt
+        total_inserted = 0
 
-        while batches_done < max_batches:
-            trades_raw = self.client.fetch_recent_trades(symbol, limit=batch_size)
-            if not trades_raw:
-                logger.info("No more trades returned for %s; stopping backfill", symbol)
-                break
+        while cur_start < end_dt:
+            cur_end = min(cur_start + window, end_dt)
 
-            rows_for_db: List[Dict[str, Any]] = []
-            reached_cutoff = False
+            start_ms = self.client.datetime_to_ms(cur_start)
+            end_ms = self.client.datetime_to_ms(cur_end)
 
-            for raw in trades_raw:
-                parsed = self._parse_trade_raw(symbol_id, raw)
-                if parsed is None:
-                    continue
+            id_less_than: Optional[str] = None
+            pages = 0
 
-                ts_ex: datetime = parsed["ts_exchange"]
-
-                # HARD STOP: once we cross the cutoff, we stop going further back
-                if ts_ex < cutoff_dt:
-                    reached_cutoff = True
+            while True:
+                pages += 1
+                trades_raw = self.client.fetch_trades_history(
+                    symbol=symbol,
+                    start=start_ms,
+                    end=end_ms,
+                    limit=min(batch_size, 1000),
+                    id_less_than=id_less_than,
+                )
+                if not trades_raw:
                     break
 
-                rows_for_db.append(parsed)
+                rows_for_db: List[Dict[str, Any]] = []
+                min_ts_in_page: Optional[datetime] = None
+                last_id_in_page: Optional[str] = None
 
-            if rows_for_db:
-                self.db.bulk_upsert_trades(rows_for_db)
-                logger.info(
-                    "Inserted %d trades for %s (batch %d)",
-                    len(rows_for_db),
-                    symbol,
-                    batches_done + 1,
-                )
+                for raw in trades_raw:
+                    parsed = self._parse_trade_raw(symbol_id, raw)
+                    if parsed is None:
+                        continue
+                    rows_for_db.append(parsed)
 
-            if reached_cutoff:
-                logger.info(
-                    "Reached trade history cutoff for %s (%s); stopping backfill",
-                    symbol,
-                    cutoff_dt.isoformat(),
-                )
-                break
+                    ts_ex = parsed["ts_exchange"]
+                    if min_ts_in_page is None or ts_ex < min_ts_in_page:
+                        min_ts_in_page = ts_ex
 
-            batches_done += 1
+                    last_id_in_page = (
+                        min(last_id_in_page, parsed["exchange_trade_id"])
+                        if last_id_in_page
+                        else parsed["exchange_trade_id"]
+                    )
+
+                if rows_for_db:
+                    self.db.bulk_upsert_trades(rows_for_db)
+                    total_inserted += len(rows_for_db)
+
+                if last_id_in_page is None:
+                    break
+
+                id_less_than = last_id_in_page
+
+                if min_ts_in_page is not None and min_ts_in_page <= cur_start:
+                    break
+
+                if pages > 2000:
+                    logger.warning(
+                        "Trades history paging safety break for %s in window %s-%s",
+                        symbol,
+                        cur_start,
+                        cur_end,
+                    )
+                    break
+
+                time.sleep(0.1)
+
+            cur_start = cur_end
             time.sleep(0.2)
 
-        if batches_done >= max_batches:
-            logger.warning(
-                "Trade backfill hit max_batches=%d for %s; stopping as safety measure",
-                max_batches,
-                symbol,
-            )
-
-        # Mark trade backfill as finished (best-effort last time = now)
         self.db.update_pipeline_status(
             symbol_id,
             version=self.version,
             sync_status="ok",
             request_status="idle",
-            trade_last_time=datetime.now(timezone.utc),
+            trade_last_time=self.db.get_last_trade_time(symbol_id)
+            or datetime.now(timezone.utc),
+        )
+
+        logger.info(
+            "Trade history backfill done for %s (inserted/upserted=%d)",
+            symbol,
+            total_inserted,
         )
 
     # -------------------------------------------------------------------------
@@ -488,11 +452,7 @@ class AcquisitionService:
 
     def run_live_loop(self) -> None:
         """
-        Simple synchronous live loop:
-          - Polls klines, trades, and orderbook at configured intervals.
-
-        For more sophistication, we can replace this with an asyncio-based
-        loop or a scheduler. But this is perfectly fine for 10-ish pairs.
+        Simple synchronous live loop polling klines/trades/orderbook.
         """
         acq = self.cfg.acquisition
         intervals = acq.live_poll_intervals
@@ -502,8 +462,7 @@ class AcquisitionService:
         next_ob_poll = time.time()
 
         logger.info(
-            "Starting live acquisition loop for market_type=%s",
-            self.client.market_type,
+            "Starting live acquisition loop for market_type=%s", self.client.market_type
         )
 
         while True:
@@ -531,10 +490,12 @@ class AcquisitionService:
         interval = acq.kline_interval
         batch_size = acq.kline_batch_size
 
+        step_ms = INTERVAL_MS.get(interval)
+
         for symbol, symbol_id in self.symbol_ids.items():
             try:
                 logger.debug("Live kline poll for %s", symbol)
-                # Strategy: just fetch last N klines; DB upsert handles duplicates.
+
                 klines_raw = self.client.fetch_klines(
                     symbol=symbol,
                     interval=interval,
@@ -552,35 +513,60 @@ class AcquisitionService:
                         continue
                     rows_for_db.append(parsed)
 
-                if rows_for_db:
-                    self.db.bulk_upsert_klines(rows_for_db)
-                    logger.info(
-                        "Live: upserted %d klines for %s",
-                        len(rows_for_db),
-                        symbol,
-                    )
+                if not rows_for_db:
+                    continue
 
-                    # last open_time in this batch
-                    last_dt = rows_for_db[-1]["open_time"]
-                    self.db.update_pipeline_status(
-                        symbol_id,
-                        version=self.version,
-                        sync_status="ok",
-                        request_status="live",
-                        kline_last_time=last_dt,
-                    )
+                # ✅ Critical fix: enforce deterministic chronological order
+                rows_for_db.sort(key=lambda r: r["open_time"])
+
+                logger.info(
+                    "Live klines %s: batch %s -> %s (n=%d)",
+                    symbol,
+                    rows_for_db[0]["open_time"].isoformat(),
+                    rows_for_db[-1]["open_time"].isoformat(),
+                    len(rows_for_db),
+                )
+
+                self.db.bulk_upsert_klines(rows_for_db)
+                logger.info("Live: upserted %d klines for %s", len(rows_for_db), symbol)
+
+                last_dt = rows_for_db[-1]["open_time"]
+                self.db.update_pipeline_status(
+                    symbol_id,
+                    version=self.version,
+                    sync_status="ok",
+                    request_status="live",
+                    kline_last_time=last_dt,
+                )
+
+                # Optional self-heal gap fill
+                if step_ms is not None:
+                    now_ms = self.client.datetime_to_ms(datetime.now(timezone.utc))
+                    end_ms = max(((now_ms // step_ms) * step_ms) - step_ms, 0)
+                    end_dt = self.client.ms_to_datetime(end_ms)
+
+                    db_last = self.db.get_last_kline_open_time(symbol_id, interval)
+                    if db_last is not None:
+                        behind = end_dt - db_last
+                        if behind > timedelta(milliseconds=2 * step_ms):
+                            start_dt = db_last + timedelta(milliseconds=step_ms)
+                            logger.warning(
+                                "Live kline poll detected gap for %s: db_last=%s end_dt=%s behind=%s; catching up...",
+                                symbol,
+                                db_last.isoformat(),
+                                end_dt.isoformat(),
+                                behind,
+                            )
+                            self._backfill_klines_for_symbol(
+                                symbol, symbol_id, interval, start_dt, end_dt
+                            )
 
             except OutageExceededError:
-                # Let the top-level main() handle extended outages and restart.
                 raise
             except Exception:
                 logger.exception("Error during live kline poll for %s", symbol)
 
     def _poll_trades_live(self) -> None:
-        """
-        Fetch recent trades and upsert them; rely on DB uniqueness on
-        (symbol_id, exchange_trade_id) to avoid duplicates.
-        """
         acq = self.cfg.acquisition
         batch_size = acq.trade_batch_size
 
@@ -601,9 +587,7 @@ class AcquisitionService:
                 if rows_for_db:
                     self.db.bulk_upsert_trades(rows_for_db)
                     logger.info(
-                        "Live: upserted %d trades for %s",
-                        len(rows_for_db),
-                        symbol,
+                        "Live: upserted %d trades for %s", len(rows_for_db), symbol
                     )
 
                     last_dt = rows_for_db[-1]["ts_exchange"]
@@ -621,11 +605,6 @@ class AcquisitionService:
                 logger.exception("Error during live trade poll for %s", symbol)
 
     def _poll_orderbook_live(self) -> None:
-        """
-        Fetch orderbook snapshots for each symbol and insert:
-          - Full JSON snapshot into orderbook_raw
-          - Top N levels (up to 5) flattened into orderbook_top_levels
-        """
         acq = self.cfg.acquisition
         depth = acq.orderbook_depth
         max_levels = min(acq.orderbook_levels, 5)
@@ -637,15 +616,12 @@ class AcquisitionService:
                 if not ob_raw:
                     continue
 
-                # For v2 mix, docs show 'ts' (timestamp ms), 'b' (bids), 'a' (asks).
-                # For spot, structure is similar. We treat it generically.
                 ts_ms = int(ob_raw.get("ts", int(time.time() * 1000)))
                 bids = ob_raw.get("bids") or ob_raw.get("b") or []
                 asks = ob_raw.get("asks") or ob_raw.get("a") or []
 
                 ts_ex = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
 
-                # --- Raw snapshot ---
                 ob_row = {
                     "symbol_id": symbol_id,
                     "ts_exchange": ts_ex,
@@ -655,11 +631,7 @@ class AcquisitionService:
                 }
                 self.db.insert_orderbook_snapshots([ob_row])
 
-                # --- Top N levels (up to 5) ---
-                top_row: Dict[str, Any] = {
-                    "symbol_id": symbol_id,
-                    "ts_exchange": ts_ex,
-                }
+                top_row: Dict[str, Any] = {"symbol_id": symbol_id, "ts_exchange": ts_ex}
 
                 for level in range(1, 6):
                     if level <= max_levels and level <= len(bids):
@@ -699,17 +671,9 @@ class AcquisitionService:
     # -------------------------------------------------------------------------
 
     def _parse_kline_raw(
-        self,
-        symbol_id: int,
-        interval: str,
-        raw: Any,
+        self, symbol_id: int, interval: str, raw: Any
     ) -> Optional[Dict[str, Any]]:
-        """
-        Parse a single raw kline array from Bitget into the dict expected
-        by DBManager.bulk_upsert_klines.
-        """
         try:
-            # raw is usually a list of strings; be defensive
             ts_ms = int(raw[0])
             open_price = float(raw[1])
             high = float(raw[2])
@@ -733,7 +697,7 @@ class AcquisitionService:
             "symbol_id": symbol_id,
             "timeframe": interval,
             "open_time": open_time,
-            "close_time": None,  # We can derive close_time from open_time+interval later
+            "close_time": None,
             "open": open_price,
             "high": high,
             "low": low,
@@ -745,25 +709,40 @@ class AcquisitionService:
         }
 
     def _parse_trade_raw(
-        self,
-        symbol_id: int,
-        raw: Dict[str, Any],
+        self, symbol_id: int, raw: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """
-        Parse a single raw trade dict from Bitget into the dict expected by
-        DBManager.bulk_upsert_trades.
-        """
         try:
-            trade_id = str(raw["tradeId"])
-            ts_ms = int(raw["ts"])
+            trade_id_val = raw.get("tradeId") or raw.get("trade_id") or raw.get("id")
+            ts_val = raw.get("ts") or raw.get("timestamp") or raw.get("time")
+
+            if trade_id_val is None or ts_val is None:
+                raise KeyError(f"Missing tradeId/ts (keys={list(raw.keys())})")
+
+            trade_id = str(trade_id_val)
+
+            ts_num = int(ts_val)
+            if ts_num < 10_000_000_000:
+                ts_num *= 1000
+
             price = float(raw["price"])
-            qty = float(raw["size"])
-            side = raw.get("side", "buy")
+            qty = float(
+                raw.get("size") if raw.get("size") is not None else raw["quantity"]
+            )
+
+            side = (raw.get("side") or "buy").lower()
+            if side not in ("buy", "sell"):
+                if side == "bid":
+                    side = "buy"
+                elif side == "ask":
+                    side = "sell"
+                else:
+                    side = "buy"
+
         except (KeyError, ValueError, TypeError) as e:
             logger.warning("Skipping malformed trade: %r (error: %s)", raw, e)
             return None
 
-        ts_ex = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        ts_ex = datetime.fromtimestamp(ts_num / 1000.0, tz=timezone.utc)
         return {
             "symbol_id": symbol_id,
             "exchange_trade_id": trade_id,
